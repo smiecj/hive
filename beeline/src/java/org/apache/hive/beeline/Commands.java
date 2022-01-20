@@ -1,4 +1,4 @@
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -22,6 +22,8 @@
  */
 package org.apache.hive.beeline;
 
+import org.apache.hadoop.io.IOUtils;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -30,8 +32,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.reflect.Method;
-import java.net.URI;
-import java.net.URISyntaxException;
+import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.sql.CallableStatement;
@@ -40,36 +41,25 @@ import java.sql.DatabaseMetaData;
 import java.sql.Driver;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.SQLWarning;
 import java.sql.Statement;
+import java.sql.SQLWarning;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hive.common.cli.ShellCmdExecutor;
-import org.apache.hadoop.hive.conf.HiveConf;
-import org.apache.hadoop.hive.conf.HiveVariableSource;
-import org.apache.hadoop.hive.conf.SystemVariables;
-import org.apache.hadoop.hive.conf.VariableSubstitution;
-import org.apache.hadoop.io.IOUtils;
-import org.apache.hive.beeline.logs.BeelineInPlaceUpdateStream;
-import org.apache.hive.common.util.HiveStringUtils;
 import org.apache.hive.jdbc.HiveStatement;
-import org.apache.hive.jdbc.Utils;
-import org.apache.hive.jdbc.Utils.JdbcConnectionParams;
-import org.apache.hive.jdbc.logs.InPlaceUpdateStream;
+
 
 public class Commands {
-
+  private static final Log LOG = LogFactory.getLog(Commands.class.getName());
   private final BeeLine beeLine;
   private static final int DEFAULT_QUERY_PROGRESS_INTERVAL = 1000;
   private static final int DEFAULT_QUERY_PROGRESS_THREAD_TIMEOUT = 10 * 1000;
@@ -147,7 +137,7 @@ public class Commands {
   public boolean addlocaldrivername(String line) {
     String driverName = arg1(line, "driver class name");
     try {
-      beeLine.setDrivers(beeLine.scanDrivers());
+      beeLine.setDrivers(Arrays.asList(beeLine.scanDrivers(false)));
     } catch (IOException e) {
       beeLine.error("Fail to scan drivers due to the exception:" + e);
       beeLine.error(e);
@@ -171,13 +161,13 @@ public class Commands {
       return false;
     }
 
-    ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+    URLClassLoader classLoader = (URLClassLoader) Thread.currentThread().getContextClassLoader();
     try {
       beeLine.debug(jarPath + " is added to the local beeline.");
       URLClassLoader newClassLoader = new URLClassLoader(new URL[]{p.toURL()}, classLoader);
 
       Thread.currentThread().setContextClassLoader(newClassLoader);
-      beeLine.setDrivers(beeLine.scanDrivers());
+      beeLine.setDrivers(Arrays.asList(beeLine.scanDrivers(false)));
     } catch (Exception e) {
       beeLine.error("Fail to add local jar due to the exception:" + e);
       beeLine.error(e);
@@ -187,12 +177,10 @@ public class Commands {
 
   public boolean history(String line) {
     Iterator hist = beeLine.getConsoleReader().getHistory().entries();
-    String[] tmp;
+    int index = 1;
     while(hist.hasNext()){
-      tmp = hist.next().toString().split(":", 2);
-      tmp[0] = Integer.toString(Integer.parseInt(tmp[0]) + 1);
-      beeLine.output(beeLine.getColorBuffer().pad(tmp[0], 6)
-          .append(":" + tmp[1]));
+      beeLine.output(beeLine.getColorBuffer().pad(index + ".", 6)
+          .append(hist.next().toString()));
     }
     return true;
   }
@@ -211,7 +199,7 @@ public class Commands {
         return def;
       }
       throw new IllegalArgumentException(beeLine.loc("arg-usage",
-          new Object[] {ret == null || ret.length == 0 ? "" : ret[0],
+          new Object[] {ret.length == 0 ? "" : ret[0],
               paramname}));
     }
     return ret[1];
@@ -235,8 +223,9 @@ public class Commands {
 
 
   public boolean exportedkeys(String line) throws Exception {
-    return metadata("getExportedKeys",
-        new String[] { beeLine.getConnection().getCatalog(), null, arg1(line, "table name"), });
+    return metadata("getExportedKeys", new String[] {
+        beeLine.getConnection().getCatalog(), null,
+        arg1(line, "table name"),});
   }
 
 
@@ -300,13 +289,12 @@ public class Commands {
       try {
         while (rs.next()) {
           cmds.add("DROP TABLE "
-              + rs.getString("TABLE_NAME") + beeLine.getOpts().getDelimiter());
+              + rs.getString("TABLE_NAME") + ";");
         }
       } finally {
         try {
           rs.close();
         } catch (Exception e) {
-          beeLine.error(e);
         }
       }
       // run as a batch
@@ -319,19 +307,7 @@ public class Commands {
 
   public boolean reconnect(String line) {
     if (beeLine.getDatabaseConnection() == null || beeLine.getDatabaseConnection().getUrl() == null) {
-      // First, let's try connecting using the last successful url - if that fails, then we error out.
-      String lastConnectedUrl = beeLine.getOpts().getLastConnectedUrl();
-      if (lastConnectedUrl != null){
-        Properties props = new Properties();
-        props.setProperty("url",lastConnectedUrl);
-        try {
-          return connect(props);
-        } catch (IOException e) {
-          return beeLine.error(e);
-        }
-      } else {
-        return beeLine.error(beeLine.loc("no-current-connection"));
-      }
+      return beeLine.error(beeLine.loc("no-current-connection"));
     }
     beeLine.info(beeLine.loc("reconnecting", beeLine.getDatabaseConnection().getUrl()));
     try {
@@ -347,7 +323,7 @@ public class Commands {
     TreeSet<String> names = new TreeSet<String>();
 
     if (beeLine.getDrivers() == null) {
-      beeLine.setDrivers(beeLine.scanDrivers());
+      beeLine.setDrivers(Arrays.asList(beeLine.scanDrivers(line)));
     }
 
     beeLine.info(beeLine.loc("drivers-found-count", beeLine.getDrivers().size()));
@@ -633,7 +609,6 @@ public class Commands {
             "" + beeLine.getReflector().invoke(beeLine.getDatabaseMetaData(),
                 m[i], new Object[0])));
       } catch (Exception e) {
-        beeLine.output(beeLine.getColorBuffer().pad(m[i], padlen), false);
         beeLine.handleException(e);
       }
     }
@@ -738,424 +713,8 @@ public class Commands {
     return execute(line, false, false);
   }
 
-  /**
-   * This method is used for retrieving the latest configuration from hive server2.
-   * It uses the set command processor.
-   *
-   * @return
-   */
-  private Map<String, String> getHiveVariables() {
-    Map<String, String> result = new HashMap<>();
-    BufferedRows rows = getConfInternal(true);
-    if (rows != null) {
-      while (rows.hasNext()) {
-        Rows.Row row = (Rows.Row) rows.next();
-        if (!row.isMeta) {
-          result.put(row.values[0], row.values[1]);
-        }
-      }
-    }
-    return result;
-  }
-
-  /**
-   * This method should only be used in CLI mode.
-   *
-   * @return the hive configuration from server side
-   */
-  public HiveConf getHiveConf(boolean call) {
-    HiveConf hiveConf = beeLine.getOpts().getConf();
-    if (hiveConf != null && call) {
-      return hiveConf;
-    } else {
-      return getHiveConfHelper(call);
-    }
-  }
-
-  public HiveConf getHiveConfHelper(boolean call) {
-    HiveConf conf = new HiveConf();
-    BufferedRows rows = getConfInternal(call);
-    while (rows != null && rows.hasNext()) {
-      addConf((Rows.Row) rows.next(), conf);
-    }
-    return conf;
-  }
-
-  /**
-   * Use call statement to retrieve the configurations for substitution and sql for the substitution.
-   *
-   * @param call
-   * @return
-   */
-  private BufferedRows getConfInternal(boolean call) {
-    Statement stmnt = null;
-    BufferedRows rows = null;
-    ResultSet rs = null;
-    try {
-      boolean hasResults = false;
-      DatabaseConnection dbconn = beeLine.getDatabaseConnection();
-      Connection conn = null;
-      if (dbconn != null)
-        conn = dbconn.getConnection();
-      if (conn != null) {
-        if (call) {
-          stmnt = conn.prepareCall("set");
-          hasResults = ((CallableStatement) stmnt).execute();
-        } else {
-          stmnt = beeLine.createStatement();
-          hasResults = stmnt.execute("set");
-        }
-      }
-      if (hasResults) {
-        rs = stmnt.getResultSet();
-        rows = new BufferedRows(beeLine, rs);
-      }
-    } catch (SQLException e) {
-      beeLine.error(e);
-    } finally {
-      if (rs != null) {
-        try {
-          rs.close();
-        } catch (SQLException e1) {
-          beeLine.error(e1);
-        }
-      }
-      if (stmnt != null) {
-        try {
-          stmnt.close();
-        } catch (SQLException e2) {
-          beeLine.error(e2);
-        }
-      }
-    }
-    return rows;
-  }
-
-  private void addConf(Rows.Row r, HiveConf hiveConf) {
-    if (r.isMeta) {
-      return;
-    }
-    if (r.values == null || r.values[0] == null || r.values[0].isEmpty()) {
-      return;
-    }
-    String val = r.values[0];
-    if (r.values[0].startsWith(SystemVariables.SYSTEM_PREFIX) || r.values[0]
-        .startsWith(SystemVariables.ENV_PREFIX)) {
-      return;
-    } else {
-      String[] kv = val.split("=", 2);
-      if (kv.length == 2)
-        hiveConf.set(kv[0], kv[1]);
-    }
-  }
-
-  /**
-   * Extract and clean up the first command in the input.
-   */
-  private String getFirstCmd(String cmd, int length) {
-    return cmd.substring(length).trim();
-  }
-
-  private String[] tokenizeCmd(String cmd) {
-    return cmd.split("\\s+");
-  }
-
-  private boolean isSourceCMD(String cmd) {
-    if (cmd == null || cmd.isEmpty())
-      return false;
-    String[] tokens = tokenizeCmd(cmd);
-    return tokens[0].equalsIgnoreCase("source");
-  }
-
-  private boolean sourceFile(String cmd) {
-    String[] tokens = tokenizeCmd(cmd);
-    String cmd_1 = getFirstCmd(cmd, tokens[0].length());
-
-    cmd_1 = substituteVariables(getHiveConf(false), cmd_1);
-    File sourceFile = new File(cmd_1);
-    if (!sourceFile.isFile()) {
-      return false;
-    } else {
-      boolean ret;
-      try {
-        ret = sourceFileInternal(sourceFile);
-      } catch (IOException e) {
-        beeLine.error(e);
-        return false;
-      }
-      return ret;
-    }
-  }
-
-  private boolean sourceFileInternal(File sourceFile) throws IOException {
-    BufferedReader reader = null;
-    try {
-      reader = new BufferedReader(new FileReader(sourceFile));
-      String lines = null, extra;
-      while ((extra = reader.readLine()) != null) {
-        if (beeLine.isComment(extra)) {
-          continue;
-        }
-        if (lines == null) {
-          lines = extra;
-        } else {
-          lines += "\n" + extra;
-        }
-      }
-      String[] cmds = lines.split(beeLine.getOpts().getDelimiter());
-      for (String c : cmds) {
-        c = c.trim();
-        if (!executeInternal(c, false)) {
-          return false;
-        }
-      }
-    } finally {
-      if (reader != null) {
-        reader.close();
-      }
-    }
-    return true;
-  }
-
-  public String cliToBeelineCmd(String cmd) {
-    if (cmd == null)
-      return null;
-    if (cmd.toLowerCase().equals("quit") || cmd.toLowerCase().equals("exit")) {
-      return BeeLine.COMMAND_PREFIX + cmd;
-    } else if (cmd.startsWith("!")) {
-      String shell_cmd = cmd.substring(1);
-      return "!sh " + shell_cmd;
-    } else { // local mode
-      // command like dfs
-      return cmd;
-    }
-  }
-
-  // Return false only occurred error when execution the sql and the sql should follow the rules
-  // of beeline.
-  private boolean executeInternal(String sql, boolean call) {
-    if (!beeLine.isBeeLine()) {
-      sql = cliToBeelineCmd(sql);
-    }
-
-    if (sql == null || sql.length() == 0) {
-      return true;
-    }
-
-    if (beeLine.isComment(sql)) {
-      //skip this and rest cmds in the line
-      return true;
-    }
-
-    // is source CMD
-    if (isSourceCMD(sql)) {
-      return sourceFile(sql);
-    }
-
-    if (sql.startsWith(BeeLine.COMMAND_PREFIX)) {
-      return beeLine.execCommandWithPrefix(sql);
-    }
-
-    String prefix = call ? "call" : "sql";
-
-    if (sql.startsWith(prefix)) {
-      sql = sql.substring(prefix.length());
-    }
-
-    // batch statements?
-    if (beeLine.getBatch() != null) {
-      beeLine.getBatch().add(sql);
-      return true;
-    }
-
-    if (!(beeLine.assertConnection())) {
-      return false;
-    }
-
-    ClientHook hook = ClientCommandHookFactory.get().getHook(beeLine, sql);
-
-    try {
-      Statement stmnt = null;
-      boolean hasResults;
-      Thread logThread = null;
-
-      try {
-        long start = System.currentTimeMillis();
-
-        if (call) {
-          stmnt = beeLine.getDatabaseConnection().getConnection().prepareCall(sql);
-          hasResults = ((CallableStatement) stmnt).execute();
-        } else {
-          stmnt = beeLine.createStatement();
-          // In test mode we want the operation logs regardless of the settings
-          if (!beeLine.isTestMode() && beeLine.getOpts().isSilent()) {
-            hasResults = stmnt.execute(sql);
-          } else {
-            InPlaceUpdateStream.EventNotifier eventNotifier =
-                new InPlaceUpdateStream.EventNotifier();
-            logThread = new Thread(createLogRunnable(stmnt, eventNotifier));
-            logThread.setDaemon(true);
-            logThread.start();
-            if (stmnt instanceof HiveStatement) {
-              HiveStatement hiveStatement = (HiveStatement) stmnt;
-              hiveStatement.setInPlaceUpdateStream(
-                  new BeelineInPlaceUpdateStream(
-                      beeLine.getErrorStream(),
-                      eventNotifier
-                  ));
-            }
-            hasResults = stmnt.execute(sql);
-            logThread.interrupt();
-            logThread.join(DEFAULT_QUERY_PROGRESS_THREAD_TIMEOUT);
-          }
-        }
-
-        beeLine.showWarnings();
-
-        if (hasResults) {
-          OutputFile outputFile = beeLine.getRecordOutputFile();
-          if (beeLine.isTestMode() && outputFile != null && outputFile.isActiveConverter()) {
-            outputFile.fetchStarted();
-            if (!sql.trim().toLowerCase().startsWith("explain")) {
-              outputFile.foundQuery(true);
-            } else {
-              outputFile.foundQuery(false);
-            }
-          }
-          do {
-            ResultSet rs = stmnt.getResultSet();
-            try {
-              int count = beeLine.print(rs);
-              long end = System.currentTimeMillis();
-
-              if (showReport()) {
-                beeLine.output(beeLine.loc("rows-selected", count) + " " + beeLine.locElapsedTime(end - start),
-                    true, beeLine.getErrorStream());
-              }
-            } finally {
-              if (logThread != null) {
-                logThread.join(DEFAULT_QUERY_PROGRESS_THREAD_TIMEOUT);
-                showRemainingLogsIfAny(stmnt);
-                logThread = null;
-              }
-              rs.close();
-            }
-          } while (BeeLine.getMoreResults(stmnt));
-          if (beeLine.isTestMode() && outputFile != null && outputFile.isActiveConverter()) {
-            outputFile.fetchFinished();
-          }
-        } else {
-          int count = stmnt.getUpdateCount();
-          long end = System.currentTimeMillis();
-
-          if (showReport()) {
-            beeLine.output(beeLine.loc("rows-affected", count) + " " + beeLine.locElapsedTime(end - start),
-                true, beeLine.getErrorStream());
-          }
-        }
-      } finally {
-        if (logThread != null) {
-          if (!logThread.isInterrupted()) {
-            logThread.interrupt();
-          }
-          logThread.join(DEFAULT_QUERY_PROGRESS_THREAD_TIMEOUT);
-          if (stmnt != null) {
-            showRemainingLogsIfAny(stmnt);
-          }
-        }
-        if (stmnt != null) {
-          stmnt.close();
-        }
-      }
-    } catch (Exception e) {
-      return beeLine.error(e);
-    }
-    beeLine.showWarnings();
-    if (hook != null) {
-      hook.postHook(beeLine);
-    }
-    return true;
-  }
-
-  private boolean showReport() {
-    if (beeLine.getOpts().isReport() != null) {
-      return beeLine.getOpts().isReport();
-    }
-    return !beeLine.getOpts().isSilent();
-  }
-
-  /*
-   * Check if the input line is a multi-line command which needs to read further
-   */
-  public String handleMultiLineCmd(String line) throws IOException {
-    line = HiveStringUtils.removeComments(line);
-    Character mask = (System.getProperty("jline.terminal", "").equals("jline.UnsupportedTerminal")) ? null
-                       : jline.console.ConsoleReader.NULL_MASK;
-
-    while (isMultiLine(line) && beeLine.getOpts().isAllowMultiLineCommand()) {
-      StringBuilder prompt = new StringBuilder(beeLine.getPrompt());
-      if (!beeLine.getOpts().isSilent()) {
-        for (int i = 0; i < prompt.length() - 1; i++) {
-          if (prompt.charAt(i) != '>') {
-            prompt.setCharAt(i, i % 2 == 0 ? '.' : ' ');
-          }
-        }
-      }
-      String extra;
-      //avoid NPE below if for some reason -e argument has multi-line command
-      if (beeLine.getConsoleReader() == null) {
-        throw new RuntimeException("Console reader not initialized. This could happen when there "
-            + "is a multi-line command using -e option and which requires further reading from console");
-      }
-      if (beeLine.getOpts().isSilent() && beeLine.getOpts().getScriptFile() != null) {
-        extra = beeLine.getConsoleReader().readLine(null, mask);
-      } else {
-        extra = beeLine.getConsoleReader().readLine(prompt.toString());
-      }
-
-      if (extra == null) { //it happens when using -f and the line of cmds does not end with ;
-        break;
-      }
-      extra = HiveStringUtils.removeComments(extra);
-      if (extra != null && !extra.isEmpty()) {
-        line += "\n" + extra;
-      }
-    }
-    return line;
-  }
-
-  //returns true if statement represented by line is
-  //not complete and needs additional reading from
-  //console. Used in handleMultiLineCmd method
-  //assumes line would never be null when this method is called
-  private boolean isMultiLine(String line) {
-    line = line.trim();
-    if (line.endsWith(beeLine.getOpts().getDelimiter()) || beeLine.isComment(line)) {
-      return false;
-    }
-    // handles the case like line = show tables; --test comment
-    List<String> cmds = getCmdList(line, false);
-    if (!cmds.isEmpty() && cmds.get(cmds.size() - 1).trim().startsWith("--")) {
-      return false;
-    }
-    return true;
-  }
-
   public boolean sql(String line, boolean entireLineAsCommand) {
     return execute(line, false, entireLineAsCommand);
-  }
-
-  public String substituteVariables(HiveConf conf, String line) {
-    if (!beeLine.isBeeLine()) {
-      // Substitution is only supported in non-beeline mode.
-      return new VariableSubstitution(new HiveVariableSource() {
-        @Override
-        public Map<String, String> getHiveVariable() {
-          return getHiveVariables();
-        }
-      }).substitute(conf, line);
-    }
-    return line;
   }
 
   public boolean sh(String line) {
@@ -1168,8 +727,9 @@ public class Commands {
     }
 
     line = line.substring("sh".length()).trim();
-    if (!beeLine.isBeeLine())
-      line = substituteVariables(getHiveConf(false), line.trim());
+
+    // Support variable substitution. HIVE-6791.
+    // line = new VariableSubstitution().substitute(new HiveConf(BeeLine.class), line.trim());
 
     try {
       ShellCmdExecutor executor = new ShellCmdExecutor(line, beeLine.getOutputStream(),
@@ -1182,6 +742,7 @@ public class Commands {
       return true;
     } catch (Exception e) {
       beeLine.error("Exception raised from Shell command " + e);
+      beeLine.error(e);
       return false;
     }
   }
@@ -1201,140 +762,185 @@ public class Commands {
     // the continuation lines! This is logged as sf.net
     // bug 879518.
 
-    // use multiple lines for statements not terminated by the delimiter
+    // use multiple lines for statements not terminated by ";"
     try {
-      line = handleMultiLineCmd(line);
+      //When using -e, console reader is not initialized and command is a single line
+      while (beeLine.getConsoleReader() != null && !(line.trim().endsWith(";"))
+        && beeLine.getOpts().isAllowMultiLineCommand()) {
+
+        if (!beeLine.getOpts().isSilent()) {
+          StringBuilder prompt = new StringBuilder(beeLine.getPrompt());
+          for (int i = 0; i < prompt.length() - 1; i++) {
+            if (prompt.charAt(i) != '>') {
+              prompt.setCharAt(i, i % 2 == 0 ? '.' : ' ');
+            }
+          }
+        }
+
+        String extra = null;
+        if (beeLine.getOpts().isSilent() && beeLine.getOpts().getScriptFile() != null) {
+          extra = beeLine.getConsoleReader().readLine(null, jline.console.ConsoleReader.NULL_MASK);
+        } else {
+          extra = beeLine.getConsoleReader().readLine(beeLine.getPrompt());
+        }
+
+        if (extra == null) { //it happens when using -f and the line of cmds does not end with ;
+          break;
+        }
+        if (!beeLine.isComment(extra)) {
+          line += "\n" + extra;
+        }
+      }
     } catch (Exception e) {
       beeLine.handleException(e);
     }
 
+    if (!(beeLine.assertConnection())) {
+      return false;
+    }
+
     line = line.trim();
-    List<String> cmdList = getCmdList(line, entireLineAsCommand);
-    for (int i = 0; i < cmdList.size(); i++) {
-      String sql = cmdList.get(i).trim();
-      if (sql.length() != 0) {
-        if (!executeInternal(sql, call)) {
-          return false;
+
+    // smiecj: fix parse ; in regex replace problem
+    List<String> cmdList = new ArrayList<String>();
+    if (entireLineAsCommand) {
+      cmdList.add(line);
+    } else {
+      StringBuffer command = new StringBuffer();
+      for (String cmdpart: line.split(";")) {
+        if (cmdpart.endsWith("\\")) {
+          command.append(cmdpart.substring(0, cmdpart.length() -1)).append(";");
+          continue;
+        } else {
+          command.append(cmdpart);
         }
+        cmdList.add(command.toString());
+        command.setLength(0);
+      }
+    }
+    for (int i = 0; i < cmdList.size(); i++) {
+      String sql = cmdList.get(i);
+      if (sql.length() != 0) {
+        if (beeLine.isComment(sql)) {
+          //skip this and rest cmds in the line
+          break;
+        }
+        if (sql.startsWith(BeeLine.COMMAND_PREFIX)) {
+          sql = sql.substring(1);
+        }
+
+        String prefix = call ? "call" : "sql";
+
+        if (sql.startsWith(prefix)) {
+          sql = sql.substring(prefix.length());
+        }
+
+        // batch statements?
+        if (beeLine.getBatch() != null) {
+          beeLine.getBatch().add(sql);
+          continue;
+        }
+
+        try {
+          Statement stmnt = null;
+          boolean hasResults;
+          Thread logThread = null;
+
+          try {
+            long start = System.currentTimeMillis();
+
+            if (call) {
+              stmnt = beeLine.getDatabaseConnection().getConnection().prepareCall(sql);
+              hasResults = ((CallableStatement) stmnt).execute();
+            } else {
+              stmnt = beeLine.createStatement();
+              if (beeLine.getOpts().isSilent()) {
+                hasResults = stmnt.execute(sql);
+              } else {
+                logThread = new Thread(createLogRunnable(stmnt));
+                logThread.setDaemon(true);
+                logThread.start();
+                hasResults = stmnt.execute(sql);
+                logThread.interrupt();
+                logThread.join(DEFAULT_QUERY_PROGRESS_THREAD_TIMEOUT);
+              }
+            }
+
+            beeLine.showWarnings();
+
+            if (hasResults) {
+              do {
+                ResultSet rs = stmnt.getResultSet();
+                try {
+                  int count = beeLine.print(rs);
+                  long end = System.currentTimeMillis();
+
+                  beeLine.info(beeLine.loc("rows-selected", count) + " "
+                      + beeLine.locElapsedTime(end - start));
+                } finally {
+                  if (logThread != null) {
+                    logThread.join(DEFAULT_QUERY_PROGRESS_THREAD_TIMEOUT);
+                    showRemainingLogsIfAny(stmnt);
+                    logThread = null;
+                  }
+                  rs.close();
+                }
+              } while (BeeLine.getMoreResults(stmnt));
+            } else {
+              int count = stmnt.getUpdateCount();
+              long end = System.currentTimeMillis();
+              beeLine.info(beeLine.loc("rows-affected", count)
+                  + " " + beeLine.locElapsedTime(end - start));
+            }
+          } finally {
+            if (logThread != null) {
+              if (!logThread.isInterrupted()) {
+                logThread.interrupt();
+              }
+              logThread.join(DEFAULT_QUERY_PROGRESS_THREAD_TIMEOUT);
+              showRemainingLogsIfAny(stmnt);
+            }
+            if (stmnt != null) {
+              stmnt.close();
+            }
+          }
+        } catch (Exception e) {
+          return beeLine.error(e);
+        }
+        beeLine.showWarnings();
       }
     }
     return true;
   }
 
-  private enum SectionType {
-    SINGLE_QUOTED, DOUBLE_QUOTED, LINE_COMMENT, BLOCK_COMMENT
-  }
-
-  /**
-   * Helper method to parse input from Beeline and convert it to a {@link List} of commands that
-   * can be executed. This method contains logic for handling delimiters that are placed within
-   * quotations. It iterates through each character in the line and checks to see if it is the delimiter, ',
-   * or "
-   */
-  List<String> getCmdList(String line, boolean entireLineAsCommand) {
-    if (entireLineAsCommand) {
-      return Stream.of(line).collect(Collectors.toList());
-    }
-    List<String> cmdList = new ArrayList<String>();
-    StringBuilder command = new StringBuilder();
-
-    // Marker to track if there is a special section open
-    SectionType sectionType = null;
-
-    // Index of the last seen delimiter in the given line
-    int lastDelimiterIndex = 0;
-
-    // Marker to track if the previous character was an escape character
-    boolean wasPrevEscape = false;
-
-    int index = 0;
-
-    // Iterate through the line and invoke the addCmdPart method whenever the delimiter is seen that is not inside a
-    // quoted string
-    for (; index < line.length();) {
-      if (!wasPrevEscape && sectionType == null && line.startsWith("'", index)) {
-        // Opening non-escaped single quote
-        sectionType = SectionType.SINGLE_QUOTED;
-        index++;
-      } else if (!wasPrevEscape && sectionType == SectionType.SINGLE_QUOTED && line.startsWith("'", index)) {
-        // Closing non-escaped single quote
-        sectionType = null;
-        index++;
-      } else if (!wasPrevEscape && sectionType == null && line.startsWith("\"", index)) {
-        // Opening non-escaped double quote
-        sectionType = SectionType.DOUBLE_QUOTED;
-        index++;
-      } else if (!wasPrevEscape && sectionType == SectionType.DOUBLE_QUOTED && line.startsWith("\"", index)) {
-        // Closing non-escaped double quote
-        sectionType = null;
-        index++;
-      } else if (sectionType == null && line.startsWith("--", index)) {
-        // Opening line comment with (non-escapable?) double-dash
-        sectionType = SectionType.LINE_COMMENT;
-        wasPrevEscape = false;
-        index += 2;
-      } else if (sectionType == SectionType.LINE_COMMENT && line.startsWith("\n", index)) {
-        // Closing line comment with (non-escapable?) newline
-        sectionType = null;
-        wasPrevEscape = false;
-        index++;
-      } else if (sectionType == null && line.startsWith("/*", index)) {
-        // Opening block comment with (non-escapable?) /*
-        sectionType = SectionType.BLOCK_COMMENT;
-        wasPrevEscape = false;
-        index += 2;
-      } else if (sectionType == SectionType.BLOCK_COMMENT && line.startsWith("*/", index)) {
-        // Closing line comment with (non-escapable?) newline
-        sectionType = null;
-        wasPrevEscape = false;
-        index += 2;
-      } else if (line.startsWith("\\", index)) {
-        // Escape character seen (anywhere)
-        wasPrevEscape = !wasPrevEscape;
-        index++;
-      } else if (sectionType == null && line.startsWith(beeLine.getOpts().getDelimiter(), index)) {
-        // If the delimiter is seen, and the line isn't inside a section, then treat
-        // line[lastDelimiterIndex] to line[index] as a single command
-        addCmdPart(cmdList, command, line.substring(lastDelimiterIndex, index));
-        index += beeLine.getOpts().getDelimiter().length();
-        lastDelimiterIndex = index;
-        wasPrevEscape = false;
-      } else {
-        wasPrevEscape = false;
-        index++;
-      }
-    }
-    // If the line doesn't end with the delimiter or if the line is empty, add the cmd part
-    if (lastDelimiterIndex != index || line.length() == 0) {
-      addCmdPart(cmdList, command, line.substring(lastDelimiterIndex, index));
-    }
-    return cmdList;
-  }
-
-  /**
-   * Given a cmdpart (e.g. if a command spans multiple lines), add to the current command, and if
-   * applicable add that command to the {@link List} of commands
-   */
-  private void addCmdPart(List<String> cmdList, StringBuilder command, String cmdpart) {
-    if (cmdpart.endsWith("\\")) {
-      command.append(cmdpart.substring(0, cmdpart.length() - 1)).append(beeLine.getOpts().getDelimiter());
-      return;
-    } else {
-      command.append(cmdpart);
-    }
-    cmdList.add(command.toString());
-    command.setLength(0);
-  }
-
-  private Runnable createLogRunnable(final Statement statement,
-      InPlaceUpdateStream.EventNotifier eventNotifier) {
+  private Runnable createLogRunnable(Statement statement) {
     if (statement instanceof HiveStatement) {
-      return new LogRunnable(this, (HiveStatement) statement, DEFAULT_QUERY_PROGRESS_INTERVAL,
-          eventNotifier);
+      final HiveStatement hiveStatement = (HiveStatement) statement;
+
+      Runnable runnable = new Runnable() {
+        @Override
+        public void run() {
+          while (hiveStatement.hasMoreLogs()) {
+            try {
+              // fetch the log periodically and output to beeline console
+              for (String log : hiveStatement.getQueryLog()) {
+                beeLine.info(log);
+              }
+              Thread.sleep(DEFAULT_QUERY_PROGRESS_INTERVAL);
+            } catch (SQLException e) {
+              beeLine.error(new SQLWarning(e));
+              return;
+            } catch (InterruptedException e) {
+              beeLine.debug("Getting log thread is interrupted, since query is done!");
+              showRemainingLogsIfAny(hiveStatement);
+              return;
+            }
+          }
+        }
+      };
+      return runnable;
     } else {
-      beeLine.debug(
-          "The statement instance is not HiveStatement type: " + statement
-              .getClass());
+      beeLine.debug("The statement instance is not HiveStatement type: " + statement.getClass());
       return new Runnable() {
         @Override
         public void run() {
@@ -1344,73 +950,10 @@ public class Commands {
     }
   }
 
-  private void error(Throwable throwable) {
-    beeLine.error(throwable);
-  }
-
-  private void debug(String message) {
-    beeLine.debug(message);
-  }
-
-  static class LogRunnable implements Runnable {
-    private final Commands commands;
-    private final HiveStatement hiveStatement;
-    private final long queryProgressInterval;
-    private final InPlaceUpdateStream.EventNotifier notifier;
-
-    LogRunnable(Commands commands, HiveStatement hiveStatement,
-        long queryProgressInterval, InPlaceUpdateStream.EventNotifier eventNotifier) {
-      this.hiveStatement = hiveStatement;
-      this.commands = commands;
-      this.queryProgressInterval = queryProgressInterval;
-      this.notifier = eventNotifier;
-    }
-
-    private void updateQueryLog() {
-      try {
-        List<String> queryLogs = hiveStatement.getQueryLog();
-        for (String log : queryLogs) {
-          if (!commands.beeLine.isTestMode()) {
-            commands.beeLine.info(log);
-          } else {
-            // In test mode print the logs to the output
-            commands.beeLine.output(log);
-          }
-        }
-        if (!queryLogs.isEmpty()) {
-          notifier.operationLogShowedToUser();
-        }
-      } catch (SQLException e) {
-        commands.error(new SQLWarning(e));
-      }
-    }
-
-    @Override public void run() {
-      try {
-        while (hiveStatement.hasMoreLogs()) {
-          /*
-            get the operation logs once and print it, then wait till progress bar update is complete
-            before printing the remaining logs.
-          */
-          if (notifier.canOutputOperationLogs()) {
-            commands.debug("going to print operations logs");
-            updateQueryLog();
-            commands.debug("printed operations logs");
-          }
-          Thread.sleep(queryProgressInterval);
-        }
-      } catch (InterruptedException e) {
-        commands.debug("Getting log thread is interrupted, since query is done!");
-      } finally {
-        commands.showRemainingLogsIfAny(hiveStatement);
-      }
-    }
-  }
-
   private void showRemainingLogsIfAny(Statement statement) {
     if (statement instanceof HiveStatement) {
       HiveStatement hiveStatement = (HiveStatement) statement;
-      List<String> logs = null;
+      List<String> logs;
       do {
         try {
           logs = hiveStatement.getQueryLog();
@@ -1419,12 +962,7 @@ public class Commands {
           return;
         }
         for (String log : logs) {
-          if (!beeLine.isTestMode()) {
-            beeLine.info(log);
-          } else {
-            // In test mode print the logs to the output
-            beeLine.output(log);
-          }
+          beeLine.info(log);
         }
       } while (logs.size() > 0);
     } else {
@@ -1438,9 +976,6 @@ public class Commands {
     return true;
   }
 
-  public boolean exit(String line) {
-    return quit(line);
-  }
 
   /**
    * Close all connections.
@@ -1448,6 +983,7 @@ public class Commands {
   public boolean closeall(String line) {
     if (close(null)) {
       while (close(null)) {
+        ;
       }
       return true;
     }
@@ -1463,11 +999,11 @@ public class Commands {
       return false;
     }
     try {
-      if (beeLine.getDatabaseConnection().getCurrentConnection() != null
-          && !(beeLine.getDatabaseConnection().getCurrentConnection().isClosed())) {
+      if (beeLine.getDatabaseConnection().getConnection() != null
+          && !(beeLine.getDatabaseConnection().getConnection().isClosed())) {
         int index = beeLine.getDatabaseConnections().getIndex();
         beeLine.info(beeLine.loc("closing", index, beeLine.getDatabaseConnection()));
-        beeLine.getDatabaseConnection().getCurrentConnection().close();
+        beeLine.getDatabaseConnection().getConnection().close();
       } else {
         beeLine.info(beeLine.loc("already-closed"));
       }
@@ -1534,70 +1070,21 @@ public class Commands {
 
     Properties props = new Properties();
     if (url != null) {
-      String saveUrl = getUrlToUse(url);
-      props.setProperty(JdbcConnectionParams.PROPERTY_URL, saveUrl);
+      props.setProperty("url", url);
     }
-
-    String value = null;
     if (driver != null) {
-      props.setProperty(JdbcConnectionParams.PROPERTY_DRIVER, driver);
-    } else {
-      value = Utils.parsePropertyFromUrl(url, JdbcConnectionParams.PROPERTY_DRIVER);
-      if (value != null) {
-        props.setProperty(JdbcConnectionParams.PROPERTY_DRIVER, value);
-      }
+      props.setProperty("driver", driver);
     }
-
     if (user != null) {
-      props.setProperty(JdbcConnectionParams.AUTH_USER, user);
-    } else {
-      value = Utils.parsePropertyFromUrl(url, JdbcConnectionParams.AUTH_USER);
-      if (value != null) {
-        props.setProperty(JdbcConnectionParams.AUTH_USER, value);
-      }
+      props.setProperty("user", user);
     }
-
     if (pass != null) {
-      props.setProperty(JdbcConnectionParams.AUTH_PASSWD, pass);
-    } else {
-      value = Utils.parsePropertyFromUrl(url, JdbcConnectionParams.AUTH_PASSWD);
-      if (value != null) {
-        props.setProperty(JdbcConnectionParams.AUTH_PASSWD, value);
-      }
+      props.setProperty("password", pass);
     }
 
-    value = Utils.parsePropertyFromUrl(url, JdbcConnectionParams.AUTH_TYPE);
-    if (value != null) {
-      props.setProperty(JdbcConnectionParams.AUTH_TYPE, value);
-    }
     return connect(props);
   }
 
-  private String getUrlToUse(String urlParam) {
-    boolean useIndirectUrl = false;
-    // If the url passed to us is a valid url with a protocol, we use it as-is
-    // Otherwise, we assume it is a name of parameter that we have to get the url from
-    try {
-      URI tryParse = new URI(urlParam);
-      if (tryParse.getScheme() == null){
-        // param had no scheme, so not a URL
-        useIndirectUrl = true;
-      }
-    } catch (URISyntaxException e){
-      // param did not parse as a URL, so not a URL
-      useIndirectUrl = true;
-    }
-    if (useIndirectUrl){
-      // Use url param indirectly - as the name of an env var that contains the url
-      // If the urlParam is "default", we would look for a BEELINE_URL_DEFAULT url
-      String envUrl = beeLine.getOpts().getEnv().get(
-          BeeLineOpts.URL_ENV_PREFIX + urlParam.toUpperCase());
-      if (envUrl != null){
-        return envUrl;
-      }
-    }
-    return urlParam; // default return the urlParam passed in as-is.
-  }
 
   private String getProperty(Properties props, String[] keys) {
     for (int i = 0; i < keys.length; i++) {
@@ -1619,27 +1106,29 @@ public class Commands {
     return null;
   }
 
+
   public boolean connect(Properties props) throws IOException {
     String url = getProperty(props, new String[] {
-        JdbcConnectionParams.PROPERTY_URL,
+        "url",
         "javax.jdo.option.ConnectionURL",
         "ConnectionURL",
     });
     String driver = getProperty(props, new String[] {
-        JdbcConnectionParams.PROPERTY_DRIVER,
+        "driver",
         "javax.jdo.option.ConnectionDriverName",
         "ConnectionDriverName",
     });
     String username = getProperty(props, new String[] {
-        JdbcConnectionParams.AUTH_USER,
+        "user",
         "javax.jdo.option.ConnectionUserName",
         "ConnectionUserName",
     });
     String password = getProperty(props, new String[] {
-        JdbcConnectionParams.AUTH_PASSWD,
+        "password",
         "javax.jdo.option.ConnectionPassword",
         "ConnectionPassword",
     });
+    String auth = getProperty(props, new String[] {"auth"});
 
     if (url == null || url.length() == 0) {
       return beeLine.error("Property \"url\" is required");
@@ -1650,56 +1139,40 @@ public class Commands {
       }
     }
 
-    String auth = getProperty(props, new String[] {JdbcConnectionParams.AUTH_TYPE});
+    beeLine.info("Connecting to " + url);
+
+    if (username == null) {
+      username = beeLine.getConsoleReader().readLine("Enter username for " + url + ": ");
+    }
+    props.setProperty("user", username);
+    if (password == null) {
+      password = beeLine.getConsoleReader().readLine("Enter password for " + url + ": ",
+          new Character('*'));
+    }
+    props.setProperty("password", password);
+
     if (auth == null) {
       auth = beeLine.getOpts().getAuthType();
-      if (auth != null) {
-        props.setProperty(JdbcConnectionParams.AUTH_TYPE, auth);
-      }
     }
-
-    beeLine.info("Connecting to " + url);
-    if (Utils.parsePropertyFromUrl(url, JdbcConnectionParams.AUTH_PRINCIPAL) == null
-        && !JdbcConnectionParams.AUTH_SSO_BROWSER_MODE.equals(auth)) {
-      String urlForPrompt = url.substring(0, url.contains(";") ? url.indexOf(';') : url.length());
-      if (username == null) {
-        username = beeLine.getConsoleReader().readLine("Enter username for " + urlForPrompt + ": ");
-      }
-      props.setProperty(JdbcConnectionParams.AUTH_USER, username);
-      if (password == null) {
-        password = beeLine.getConsoleReader().readLine("Enter password for " + urlForPrompt + ": ",
-          new Character('*'));
-      }
-      props.setProperty(JdbcConnectionParams.AUTH_PASSWD, password);
+    if (auth != null) {
+      props.setProperty("auth", auth);
     }
 
     try {
       beeLine.getDatabaseConnections().setConnection(
           new DatabaseConnection(beeLine, driver, url, props));
       beeLine.getDatabaseConnection().getConnection();
-
-      if (!beeLine.isBeeLine()) {
-        beeLine.updateOptsForCli();
-      }
-
-      int initScriptExecutionResult = beeLine.runInit();
-
-      //if execution of the init script(s) return anything other than ERRNO_OK from beeline
-      //exit beeline with error unless --force is set
-      if(initScriptExecutionResult != 0 && !beeLine.getOpts().getForce()) {
-        return beeLine.error("init script execution failed.");
-      }
+      beeLine.runInit();
 
       beeLine.setCompletions();
-      beeLine.getOpts().setLastConnectedUrl(url);
       return true;
     } catch (SQLException sqle) {
-      beeLine.getDatabaseConnections().remove();
       return beeLine.error(sqle);
     } catch (IOException ioe) {
       return beeLine.error(ioe);
     }
   }
+
 
   public boolean rehash(String line) {
     try {
@@ -1739,6 +1212,7 @@ public class Commands {
 
     return true;
   }
+
 
   public boolean all(String line) {
     int index = beeLine.getDatabaseConnections().getIndex();
@@ -1833,10 +1307,60 @@ public class Commands {
       return false;
     }
 
+    List<String> cmds = new LinkedList<String>();
+
     try {
-      String[] cmds = beeLine.getCommands(new File(parts[1]));
+      BufferedReader reader = new BufferedReader(new FileReader(
+          parts[1]));
+      try {
+        // ### NOTE: fix for sf.net bug 879427
+        StringBuilder cmd = null;
+        for (;;) {
+          String scriptLine = reader.readLine();
+
+          if (scriptLine == null) {
+            break;
+          }
+
+          String trimmedLine = scriptLine.trim();
+          if (beeLine.getOpts().getTrimScripts()) {
+            scriptLine = trimmedLine;
+          }
+
+          if (cmd != null) {
+            // we're continuing an existing command
+            cmd.append(" \n");
+            cmd.append(scriptLine);
+            if (trimmedLine.endsWith(";")) {
+              // this command has terminated
+              cmds.add(cmd.toString());
+              cmd = null;
+            }
+          } else {
+            // we're starting a new command
+            if (beeLine.needsContinuation(scriptLine)) {
+              // multi-line
+              cmd = new StringBuilder(scriptLine);
+            } else {
+              // single-line
+              cmds.add(scriptLine);
+            }
+          }
+        }
+
+        if (cmd != null) {
+          // ### REVIEW: oops, somebody left the last command
+          // unterminated; should we fix it for them or complain?
+          // For now be nice and fix it.
+          cmd.append(";");
+          cmds.add(cmd.toString());
+        }
+      } finally {
+        reader.close();
+      }
+
       // success only if all the commands were successful
-      return beeLine.runCommands(cmds) == cmds.length;
+      return beeLine.runCommands(cmds) == cmds.size();
     } catch (Exception e) {
       return beeLine.error(e);
     }
@@ -1971,9 +1495,5 @@ public class Commands {
     }
     breader.close();
     return true;
-  }
-
-  public boolean delimiter(String line) {
-    return set("set " + line);
   }
 }
